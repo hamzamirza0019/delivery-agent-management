@@ -1,24 +1,24 @@
 generator client {
-  provider = "prisma-client"
-  output   = "../src/generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 enum AgentStatus {
-  AVAILABLE
-  ON_DELIVERY
+  ACTIVE
   INACTIVE
 }
 
 model DeliveryAgent {
-  id        String      @id @default(uuid())
-  name      String
-  email     String      @unique
-  phone     String      @unique
-  status    AgentStatus @default(AVAILABLE)
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
+  id          String      @id @default(uuid())
+  name        String
+  email       String      @unique
+  phone       String      @unique
+  serviceArea String
+  status      AgentStatus @default(ACTIVE)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
 }
