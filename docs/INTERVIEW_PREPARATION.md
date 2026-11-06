@@ -5,7 +5,7 @@ This document tracks the technical concepts, implementation details, architectur
 
 **Purpose:** Use this document for technical interview preparation and project explanation.
 
-**Milestone: 2026-11-06.** Backend CRUD, middleware, request validation, and centralized errors are implemented. Startup, connections, migrations, create/list, and duplicate-phone rejection have reported successful checks, not reruns in this documentation update. Individual retrieval and update/delete still need verification. Redis caching and React remain planned.
+**Milestone: 2026-11-06.** The full backend audit passed 74 tests: 51 real HTTP/PostgreSQL/Redis integration tests, six HTTP middleware/error tests, and 17 existing fallback tests. CRUD, validation, cache invalidation, live Docker Redis outage, startup with Redis absent, and automatic recovery were observed. A malformed-JSON input-disclosure defect was fixed. PostgreSQL stayed running, so restart persistence is not verified; neither production readiness nor frontend implementation is claimed.
 
 ---
 
@@ -21,7 +21,7 @@ A full-stack Delivery Agent Management System that allows users to create, retri
 | Backend | Node.js + Express 5, JavaScript ES modules |
 | Database | PostgreSQL |
 | ORM | Prisma 6.19.3 (initially 7.10.1) |
-| Caching | Redis connection implemented; caching planned |
+| Caching | Optional Redis cache-aside implementation, 60-second TTL |
 | Validation | Zod |
 | Infrastructure | Docker Compose |
 | Version Control | Git on main; GitHub submission planned |
@@ -79,7 +79,7 @@ This command:
 
 Migration files should be version controlled with application source.
 
-In this project, migrations are intended to be version controlled; the second migration is currently untracked in the working tree and still needs the user's Git review. Both are reported applied locally:
+In this project, both migrations are version controlled and verified applied locally. Client generation and live database/schema comparison also passed:
 
 - `20261106100604_init`: initial table, unique indexes, original AVAILABLE/ON_DELIVERY/INACTIVE statuses.
 - `20261106114931_add_service_area_and_status`: required service area and ACTIVE/INACTIVE statuses, default ACTIVE.
@@ -137,7 +137,7 @@ app.get("/api/agents", (req, res) => {
 
 REST is an architectural style for designing APIs around resources.
 
-Implemented endpoints (individual retrieval, update, and delete verification pending):
+Implemented endpoints (all CRUD operations verified through HTTP against a disposable test database):
 
 | Method | Endpoint | Operation |
 |---|---|---|
@@ -161,7 +161,7 @@ Current order: Helmet, CORS, JSON parsing, Morgan, health/agent routes, unmatche
 - Morgan logs HTTP requests in development format.
 - Error middleware uses the four-argument `(err, req, res, next)` signature and runs after routes.
 
-Express 5 automatically forwards rejected async handlers to error middleware. This does not guarantee that every error has the right HTTP mapping; parser and parameterized-route behavior still need tests.
+Express 5 automatically forwards rejected async handlers to error middleware. The audit exercised a real Prisma connection rejection through an async controller and verified a generic HTTP 500. Malformed JSON returns a generic 400; invalid UUIDs return Zod 400 responses. These checks do not certify every possible parser or transport failure.
 
 ## 3.5 Controllers and Services (Implemented)
 
@@ -176,6 +176,7 @@ Create calls `agentService.createAgent(req.body)`. Update passes `req.params.id`
 | 200 | Reads, update, delete, health |
 | 201 | Agent created |
 | 400 | Zod validation failure |
+| 400 | Malformed JSON with generic `Invalid JSON body` message |
 | 404 | Missing agent or unmatched route |
 | 409 | Duplicate email/phone via Prisma P2002 |
 | 500 | Unexpected server error with generic client message |
@@ -275,8 +276,8 @@ The schema uses `prisma-client-js`, and `npx prisma generate` regenerates the cl
 
 ## 4.6 Prisma Errors (Implemented Handling)
 
-- P2002: a unique constraint failed. Error middleware returns HTTP 409 with `Email or phone number already exists`. Duplicate phone rejection has a reported successful test; duplicate email still needs verification.
-- P2025: an operation required a missing record, such as update/delete. Middleware returns HTTP 404 with `Delivery agent not found`; endpoint verification is pending.
+- P2002: a unique constraint failed. Error middleware returns HTTP 409 with `Email or phone number already exists`. Real duplicate email/phone failures were verified for create and update.
+- P2025: an operation required a missing record, such as update/delete. Middleware returns HTTP 404 with `Delivery agent not found`; real missing update/delete targets were verified through HTTP.
 - `findUnique` returns `null` for a missing individual lookup. The service explicitly throws a 404 rather than relying on P2025.
 
 Database uniqueness, not the email/phone format schema, prevents duplicates. A pre-check alone would not protect against concurrent insert races.
@@ -341,10 +342,11 @@ PostgreSQL 17 and Redis 7 run in containers with host port mappings 5432 and 637
 Redis is an in-memory data store commonly used for caching.
 
 In our application:
-- PostgreSQL stores permanent records.
-- Redis connects at startup, but does not yet store API response caches.
+- PostgreSQL stores permanent records and remains the source of truth.
+- Redis caches list and individual-agent JSON responses with a 60-second TTL.
+- Redis is optional for startup and request handling; PostgreSQL is required.
 
-**Sections 6.2-6.4 describe planned concepts, not implemented behavior.** Agent services currently query PostgreSQL directly. Startup requires an initial Redis connection; fallback when Redis is unavailable has not been implemented.
+**Sections 6.2-6.5 describe implemented and tested behavior.** Actual Redis list/detail values and TTLs, populated-key invalidation, and complete offline CRUD/recovery workflows passed the live audit. Missed invalidation and concurrent repopulation remain consistency limitations.
 
 ## 6.2 Why Caching?
 
@@ -362,23 +364,55 @@ Flow:
 2. Backend checks Redis.
 3. If cache hit, return cached data.
 4. If cache miss, query PostgreSQL.
-5. Store the result in Redis.
+5. Best-effort store the JSON result in Redis with `EX: 60`.
 6. Return the result.
+
+On cache unavailability or a GET/JSON parsing failure, continue to PostgreSQL. SET failures must not change a successful database-read response. Missing agents retain the existing 404 and are not cached as successful records.
 
 ## 6.4 Cache Invalidation
 
-When caching is implemented, an agent create/update/delete must invalidate or refresh affected cached data.
+After a successful database mutation, cache invalidation is best effort and must not make the mutation fail solely because Redis is down.
 
 Otherwise, users might receive stale data.
 
-Planned cache keys:
+Implemented cache keys (unchanged):
 
 - `agents:list`
 - `agents:{id}`
 
-The actual TTL and invalidation implementation will be documented after development.
+TTL is 60 seconds, set on each cache population, not refreshed on hits.
 
-Planned invalidation: create clears the list; update/delete clear the list and the affected detail entry. Cache outage behavior and concurrent stale repopulation still need a design and tests.
+Create invalidates the list; update/delete invalidate the list and affected detail entry in one DEL call. PostgreSQL errors still propagate normally. Failed/skipped invalidation is not retried; existing entries can survive a short outage and remain stale until expiry after reconnect. A concurrent read can also repopulate stale data after invalidation. TTL limits cache lifetime, but is not a strict strong-consistency guarantee.
+
+## 6.5 Graceful Redis Failure Handling
+
+Reusable service helpers check `redis.isReady` and bypass Redis when it is not ready:
+
+- `getCache(key)` catches Redis and JSON parsing errors, logs them, and returns `null` for database fallback.
+- `setCache(key, value)` serializes data with the 60-second TTL; errors are logged, not rethrown.
+- `invalidateCache(...keys)` deletes the supplied keys; errors are logged, not rethrown.
+
+The installed `redis` client version is 6.3.1. `isOpen` means connection activity is open, including connecting/reconnecting; `isReady` means commands can be served. Startup guards `connect()` with `isOpen`, does not await Redis before listening, and attaches a rejection handler. Explicit retry delays grow from 50 ms to 2 seconds plus up to 199 ms of jitter, including socket timeout failures; `ready` events log initial/recovered connectivity.
+
+Offline queueing is disabled to avoid replaying cache operations after an outage. Client transport settings are a 1-second connection timeout, 2-second socket inactivity timeout, and 1-second idle ping interval. The ping maintains healthy idle connections; a stalled socket can be closed and retried. These are not the TTL or a strict per-request deadline.
+
+PostgreSQL connection failure still prevents startup and retains existing Prisma disconnect/exit handling. No new custom shutdown handler was added. A syntactically valid Redis URL is assumed; cache fallback does not cover invalid client configuration during import.
+
+### Verification Scope
+
+All 74 tests passed in the final full run. Fifty-one tests use the actual backend entrypoint with a disposable PostgreSQL database and empty Redis DB 15, including eight live Docker outage/recovery/startup checks. Six exercise real HTTP middleware/error paths, including a real Prisma connection failure against an unused port. The 17 original fallback tests remain: 16 mocked service/startup checks plus an actual-client silent-socket timeout/retry check. A real second backend process also started and served HTTP health successfully while Redis was already stopped.
+
+From `server/`:
+
+```bash
+npm test
+RUN_INTEGRATION=1 npm test
+DOCKER_HOST=unix:///var/run/docker.sock RUN_INTEGRATION=1 RUN_REDIS_OUTAGE=1 npm test
+```
+
+`npm test` now runs the native suite; live integration/outage checks are explicitly opt-in, not fake passes. The full command briefly stops shared development Redis, restores it through cleanup hooks, and never stops PostgreSQL. Its Docker host prefix works in the audited environment; adjust it for other setups. Node.js experimental module mocking is used only where tests say they mock behavior; no package or version was replaced. Follow [../README.md](../README.md#testing) for permissions, isolation, verified results, and limitations.
+
+Test data is isolated in a randomly named database populated by the existing migrations. The harness requires empty Redis DB 15, uses unique records, drops only its own database, deletes only isolated cache entries, and verifies development-record count/digest preservation. Redis was restored and cleanup independently checked. Actual Redis TTLs were inspected, not inferred from mock calls.
 
 ---
 
@@ -407,7 +441,7 @@ We use `dotenv` to load local environment variables.
 
 An `.env.example` can contain placeholder configuration and be committed, but this repository's example is currently empty. Copying it alone does not configure the backend. Use the environment table and placeholder URL in [../README.md](../README.md), with local values from [../compose.yaml](../compose.yaml); never publish actual credentials.
 
-The Zod environment module declares PORT, NODE_ENV, DATABASE_URL, and REDIS_URL, but startup does not import it. Dotenv is active; centralized environment validation is not. Startup reads PORT directly with a 5000 default and connects both services before listening. Run npm/Prisma commands from `server/` for local `.env` loading.
+The Zod environment module declares PORT, NODE_ENV, DATABASE_URL, and REDIS_URL, but startup does not import it. Dotenv is active; centralized environment validation is not. Startup reads PORT directly with a 5000 default, awaits PostgreSQL, and connects Redis in the background. Run npm/Prisma commands from `server/` for local `.env` loading.
 
 ---
 
@@ -431,7 +465,7 @@ It helps reject invalid requests before they reach the database.
 
 The example above introduces the concept; the implemented schemas additionally require `serviceArea`, allow optional ACTIVE/INACTIVE status, trim strings, and reject unknown fields. Names and service areas require two characters; phone requires ten characters, not digits-only validation. Email is not normalized to lowercase.
 
-Create requires all four main fields. Update uses `.partial()` and rejects an empty object. IDs use UUID validation on route parameters. `safeParse` failures return HTTP 400 with field/message entries; successful parsed data is assigned back to the selected request source. Parameterized routes still need compatibility/runtime checks.
+Create requires all four main fields. Update uses `.partial()` and rejects an empty object. IDs use UUID validation on route parameters. `safeParse` failures return HTTP 400 with field/message entries; successful parsed data is assigned back to the selected request source. Valid and invalid parameterized paths were exercised through HTTP. Each single-field update and a multi-field update persisted correctly and advanced `updatedAt`.
 
 ---
 
@@ -503,14 +537,17 @@ Examples:
 - Implemented CRUD routes, controllers, services, and Zod validation.
 - Implemented centralized Prisma error mappings.
 - Reported successful startup/connections, create/list, and duplicate-phone checks.
+- Implemented optional Redis cache-aside reads, 60-second TTL, and best-effort invalidation.
+- Implemented graceful Redis fallback with nonblocking startup and passed 17 focused tests (16 mocked, one actual-client transport check).
+- Passed the complete 74-test audit, including real HTTP CRUD, actual cache values/TTL/invalidation, Redis-absent startup, and Docker Redis stop/restart recovery.
+- Fixed malformed JSON responses to avoid echoing submitted input; verified async database failures return generic 500.
+- Verified Prisma generation, both applied migrations, live schema alignment, Compose health, and safe test-data cleanup.
 
 ## Pending
 
-- Verify individual retrieval, update, delete, and parameter handling.
-- Verify invalid requests, duplicate email, and missing records.
 - Populate empty environment example and wire configuration validation.
-- Add automated tests; current `npm test` is a failing placeholder.
-- Implement Redis caching and invalidation.
+- Verify PostgreSQL restart persistence when stopping it is permitted; it stayed running during this audit.
+- Extend tests for concurrency/load and stronger cache consistency if required.
 - Build React frontend.
 - Perform integration testing.
 - Complete deployment documentation.
@@ -571,15 +608,29 @@ The earlier setup expected a JavaScript import under a custom generated director
 
 ## 13.3 Implementation Is Not Verification
 
-An implemented handler and error mapping are not proof that a complete request succeeds. Create/list and duplicate phone have reported passing checks; update/delete have not. Test the full middleware path as well as the database operation, including parsed parameter assignment, not just isolated service logic.
+An implemented handler and error mapping are not proof that a complete request succeeds. Earlier evidence covered create/list and duplicate phone only; this audit now verifies update/delete and the full HTTP middleware path as well. Test parsed parameter assignment and persisted values, not just isolated service logic.
 
-Likewise, a connected Redis client is not a cache, a volume is not a persistence policy, and a written environment schema is not active unless imported.
+Likewise, a connected Redis client alone is not a cache, a volume is not a persistence policy, and a written environment schema is not active unless imported. Live Redis outage/recovery is now observed, but passing mocks alone would not establish it, and named-volume configuration does not prove restart persistence.
+
+## 13.4 Catching Redis Errors Is Not Enough
+
+The existing helpers were initially unused: services directly awaited Redis calls, and startup awaited a potentially retrying connection. Routing commands through guarded helpers fixes error propagation. Checking `isReady`, disabling the offline queue, and bounding stalled sockets address unavailable clients instead of leaving API requests queued behind reconnection. Starting Redis in the background with a rejection handler prevents both blocked HTTP startup and unhandled connection rejections.
+
+An actual-client check exposed another version-specific detail: Redis 6.3.1's default reconnect policy stops on socket timeout. An explicit jittered retry strategy was required so the added timeout detects outages without permanently disabling cache recovery. Verify defaults against installed code and runtime behavior, not just mocks.
+
+## 13.5 Malformed JSON Can Expose Submitted Input
+
+The audit sent invalid JSON through HTTP and observed raw submitted text in the parser's message. The centralized handler had returned `err.message` for a 400 error. It now handles `entity.parse.failed` separately with `Invalid JSON body`, without logging that parser object. A real HTTP regression verifies the exact generic response. Other unexpected errors still return `Internal server error`.
+
+## 13.6 Test Harness Assumptions Can Produce False Failures
+
+The first broad integration run had seven failed assertions and seven cancelled outage cases, not seven demonstrated application bugs. Redis 6.3.1's multi-key EXISTS takes an array; passing multiple arguments checked only one key. Node `pg` interprets timezone-less timestamps locally, while Prisma timestamps are treated as UTC. The harness now compares them with explicit SQL `AT TIME ZONE 'UTC'`. After those corrections the 73-test run passed; an additional live Redis-absent startup check brought the final passing suite to 74 tests.
 
 # 14. Practical Interview Questions and Answers
 
 ### Why PostgreSQL rather than storing records in Redis?
 
-PostgreSQL is the durable source of truth with relational constraints and transactions. Redis is selected for a future read cache; no response caching exists yet.
+PostgreSQL is the durable source of truth with relational constraints and transactions. Redis now provides optional cached read responses with 60-second expiry. All mutations go to PostgreSQL first, regardless of cache availability.
 
 ### Why JavaScript instead of TypeScript?
 
@@ -599,11 +650,11 @@ Controllers own HTTP behavior; services own persistence and can be exercised ind
 
 ### How do you prevent duplicate agents?
 
-Email and phone have database unique constraints. Zod validates input shape/format, not uniqueness. Prisma P2002 is mapped to 409. The duplicate-phone path has a reported successful test; duplicate-email verification is pending.
+Email and phone have database unique constraints. Zod validates input shape/format, not uniqueness. Real Prisma P2002 errors were verified as HTTP 409 for both email and phone conflicts on create/update.
 
 ### How do you handle nonexistent records?
 
-Individual `findUnique` results are checked for null and produce an explicit 404. Update/delete can produce P2025, mapped to 404. Those parameterized endpoint paths still need runtime verification.
+Individual `findUnique` results are checked for null and produce an explicit 404. Update/delete produce P2025 for missing targets, mapped to 404. Those responses and invalid UUID 400 errors passed actual HTTP tests.
 
 ### Why PATCH rather than PUT, and why not 204 for delete?
 
@@ -611,15 +662,15 @@ PATCH permits a nonempty partial update; PUT would represent replacement semanti
 
 ### What do middleware order and Express 5 change?
 
-JSON parsing must precede body validation, and error handling follows the routes. Express 5 forwards rejected async handlers automatically. Runtime compatibility, including handling of request properties in validation middleware, still needs full-path testing.
+JSON parsing precedes body validation, and error handling follows routes. Express 5 forwards rejected async handlers automatically. The audit verified parameter validation, malformed-JSON errors, and an actual Prisma connection rejection through the full HTTP path.
 
 ### What happens if Redis is unavailable?
 
-The current startup awaits Redis before listening, so an initial connection failure prevents startup. There is no cache fallback implementation. Future cache-aside outage behavior needs an explicit decision.
+Startup does not await Redis before listening, but still requires PostgreSQL. Read helpers fall back to PostgreSQL; cache writes/invalidation failures are logged without failing valid CRUD operations. Background reconnection restores cache use when the client is ready. Retained stale keys may remain until expiry because invalidation is best effort.
 
-### How would you invalidate the planned cache?
+### How do you invalidate the cache?
 
-Cache list/detail reads with TTL. After successful create invalidate the list; after update/delete invalidate the list and the affected detail key. Test consistency and concurrent stale repopulation. These are plans, not current service behavior.
+List/detail JSON values have 60-second TTLs. After successful create invalidate the list; after update/delete invalidate the list and affected detail key. Actual populated keys and subsequent fresh responses were verified. Strong consistency under concurrent cache repopulation or missed invalidation is not guaranteed.
 
 ### How do migrations differ from client generation?
 
@@ -631,8 +682,8 @@ Not while the named PostgreSQL volume is retained. Compose down retains it; down
 
 ### What would you verify next?
 
-Individual retrieval, update/delete, UUID and invalid-body handling, duplicate email, and missing records. Then add automated tests, integrate environment validation, implement Redis caching, and build React. The existing npm test command does not run tests.
+PostgreSQL restart persistence, concurrency/load behavior, and startup environment-validation integration remain. CRUD, validation, actual cache TTL/invalidation, Redis-absent startup, and live Redis outage/recovery passed. `npm test` runs the native suite; flags explicitly enable integration and disruptive outage cases. React is still outside the implemented backend.
 
 ### What should you avoid claiming in an interview?
 
-Do not claim a React interface, working Redis response caching, passed update/delete tests, active environment validation, or production readiness. Explain implemented code, reported evidence, and remaining verification separately.
+Do not claim a React interface, active centralized environment validation, PostgreSQL restart persistence, or production readiness. You can cite the 74-test audit and observed live CRUD/Redis recovery, explaining disposable-data isolation and remaining cache-consistency limitations.

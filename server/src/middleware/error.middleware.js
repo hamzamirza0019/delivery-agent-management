@@ -1,4 +1,11 @@
 export const errorHandler = (err, req, res, next) => {
+  if (err.type === "entity.parse.failed") {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid JSON body",
+    });
+  }
+
   console.error(err);
 
   if (err.code === "P2002") {
