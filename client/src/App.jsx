@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { NavLink, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { Navigate, NavLink, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   Activity, ArrowDown, ArrowDownRight, ArrowLeft, ArrowRight, ArrowUpRight, Bell,
   BriefcaseBusiness, CalendarDays, Check, CheckCircle2, ChevronDown, ChevronLeft,
@@ -9,6 +9,7 @@ import {
   PauseCircle, RefreshCw, LogOut
 } from 'lucide-react';
 import { api } from './api.js';
+import AuthPage from './AuthPage.jsx';
 
 const initials = (name = '') => name.split(/\s+/).filter(Boolean).slice(0,2).map(x => x[0]).join('').toUpperCase() || 'A';
 const statusLabel = s => String(s || 'ACTIVE').toUpperCase() === 'ACTIVE' ? 'Active' : 'Inactive';
@@ -17,6 +18,9 @@ const friendlyError = e => e?.message || 'Something went wrong. Please try again
 const getId = a => a?.id ?? a?.agentId;
 
 function App() {
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const sessionUserRef = useRef(null);
   const [agents, setAgents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -33,11 +37,38 @@ function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    const userId = user?.id;
+    if (!userId || sessionUserRef.current !== userId) return;
     setLoading(true); setLoadError('');
-    try { setAgents(await api.listAgents()); }
-    catch (e) { setLoadError(friendlyError(e)); }
-    finally { setLoading(false); }
+    try {
+      const data = await api.listAgents();
+      if (sessionUserRef.current === userId) setAgents(data);
+    }
+    catch (e) { if (sessionUserRef.current === userId) setLoadError(friendlyError(e)); }
+    finally { if (sessionUserRef.current === userId) setLoading(false); }
+  }, [user?.id]);
+
+  const logout = useCallback(() => {
+    api.setToken(null); sessionUserRef.current = null;
+    setUser(null); setAgents([]); setActivities([]); setToast(null); setLoadError(''); setMobileOpen(false);
+    navigate('/login', { replace: true });
+  }, [navigate]);
+
+  useEffect(() => {
+    let alive = true;
+    if (!api.getToken()) { setAuthLoading(false); return; }
+    api.me().then(account => {
+      if (alive) { sessionUserRef.current = account.id; setUser(account); }
+    }).catch(error => {
+      if (alive) { api.setToken(null); setLoadError(friendlyError(error)); }
+    }).finally(() => { if (alive) setAuthLoading(false); });
+    return () => { alive = false; };
   }, []);
+
+  useEffect(() => {
+    window.addEventListener('agent-hub-unauthorized', logout);
+    return () => window.removeEventListener('agent-hub-unauthorized', logout);
+  }, [logout]);
 
   useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { setMobileOpen(false); }, [location.pathname]);
@@ -47,27 +78,51 @@ function App() {
   }, []);
 
   const onCreated = async agent => {
-    await refresh(); addActivity('New agent added', `${agent.name} was added to the system.`); notify('Agent created successfully.');
+    if (sessionUserRef.current !== user?.id) return;
+    await refresh();
+    if (sessionUserRef.current !== user?.id) return;
+    addActivity('New agent added', `${agent.name} was added to the system.`); notify('Agent created successfully.');
     navigate('/agents');
   };
   const onUpdated = async agent => {
-    await refresh(); addActivity('Agent updated', `${agent.name}'s details were updated.`); notify('Agent updated successfully.');
+    if (sessionUserRef.current !== user?.id) return;
+    await refresh();
+    if (sessionUserRef.current !== user?.id) return;
+    addActivity('Agent updated', `${agent.name}'s details were updated.`); notify('Agent updated successfully.');
     navigate('/agents');
   };
   const onDeleted = async agent => {
-    await refresh(); addActivity('Agent removed', `${agent.name} was removed from the system.`); notify('Agent deleted successfully.');
+    if (sessionUserRef.current !== user?.id) return;
+    await refresh();
+    if (sessionUserRef.current !== user?.id) return;
+    addActivity('Agent removed', `${agent.name} was removed from the system.`); notify('Agent deleted successfully.');
     navigate('/agents');
   };
 
   const pageTitle = location.pathname === '/' ? 'Dashboard' : location.pathname.startsWith('/agents/') ? 'Agent Details' : location.pathname === '/add-agent' ? 'Add Agent' : 'Agents';
 
+  const authenticated = ({ token, user: account }) => {
+    api.setToken(token); sessionUserRef.current = account.id;
+    setAgents([]); setActivities([]); setLoadError(''); setUser(account); setAuthLoading(false);
+    const from = location.state?.from;
+    navigate(typeof from === 'string' && from.startsWith('/') && !from.startsWith('//') ? from : '/', { replace: true });
+  };
+
+  if (authLoading) return <div className="auth-shell loading-page">Checking your session...</div>;
+  if (!user) return <Routes>
+    <Route path="/login" element={<AuthPage key="login" mode="login" onAuthenticated={authenticated} sessionError={loadError}/>}/>
+    <Route path="/register" element={<AuthPage key="register" mode="register" onAuthenticated={authenticated}/>}/>
+    <Route path="*" element={<Navigate to="/login" replace state={{ from: location.pathname + location.search }}/>}/>
+  </Routes>;
+  if (location.pathname === '/login' || location.pathname === '/register') return <Navigate to="/" replace/>;
+
   return <div className="app-shell">
     <Sidebar mobileOpen={mobileOpen} close={() => setMobileOpen(false)} />
     <main className="main-area">
-      <Topbar onMenu={() => setMobileOpen(v=>!v)} agents={agents} loading={loading} error={loadError} />
+      <Topbar onMenu={() => setMobileOpen(v=>!v)} agents={agents} loading={loading} error={loadError} user={user} onLogout={logout} />
       <div className="page-wrap">
         <Routes>
-          <Route path="/" element={<Dashboard agents={agents} loading={loading} error={loadError} activities={activities} onRetry={refresh} onAdd={() => navigate('/add-agent')} onAgents={() => navigate('/agents')} />} />
+          <Route path="/" element={<Dashboard agents={agents} loading={loading} error={loadError} activities={activities} onRetry={refresh} onAdd={() => navigate('/add-agent')} onAgents={() => navigate('/agents')} user={user} />} />
           <Route path="/agents" element={<AgentsPage agents={agents} loading={loading} error={loadError} onRetry={refresh} onAdd={() => navigate('/add-agent')} onEdit={id=>navigate(`/agents/${id}/edit`)} onView={id=>navigate(`/agents/${id}`)} onDelete={onDeleted} notify={notify} />} />
           <Route path="/add-agent" element={<AgentForm onSubmit={onCreated} notify={notify} />} />
           <Route path="/agents/:id/edit" element={<EditAgent agents={agents} refresh={refresh} onSubmit={onUpdated} notify={notify} />} />
@@ -106,7 +161,7 @@ function Sidebar({ mobileOpen, close }) {
   </>;
 }
 
-function Topbar({ onMenu, agents, loading, error }) {
+function Topbar({ onMenu, agents, loading, error, user, onLogout }) {
   const [profileOpen, setProfileOpen] = useState(false);
   return <header className="topbar">
     <button className="mobile-menu icon-button" onClick={onMenu}><Menu size={20}/></button>
@@ -115,9 +170,9 @@ function Topbar({ onMenu, agents, loading, error }) {
       <button className="icon-button notification" aria-label="Notifications"><Bell size={20}/><i/></button>
       <div className="top-divider"/>
       <button className="profile-button" onClick={()=>setProfileOpen(v=>!v)}>
-        <span className="profile-avatar">A</span><span className="profile-name">Administrator</span><ChevronDown size={15}/>
+        <span className="profile-avatar">{initials(user.name)}</span><span className="profile-name" title={user.name}>{user.name}</span><ChevronDown size={15}/>
       </button>
-      {profileOpen && <div className="profile-menu"><strong>Admin User</strong><span>Workspace administrator</span><hr/><button onClick={()=>setProfileOpen(false)}><LogOut size={15}/> Close menu</button></div>}
+      {profileOpen && <div className="profile-menu"><strong>{user.name}</strong><span>{user.email}</span><hr/><button onClick={onLogout}><LogOut size={15}/> Log out</button></div>}
     </div>
   </header>;
 }
@@ -253,13 +308,13 @@ function MetricCard({ icon: Icon, label, value, tone, note, trend }) {
   </div>;
 }
 
-function Dashboard({ agents, loading, error, activities, onRetry, onAdd, onAgents }) {
+function Dashboard({ agents, loading, error, activities, onRetry, onAdd, onAgents, user }) {
   const active = agents.filter(a=>statusLabel(a.status)==='Active').length;
   const inactive = agents.length-active;
   const recent = [...agents].sort((a,b)=>new Date(b.createdAt||0)-new Date(a.createdAt||0)).slice(0,3);
   const feed = activities.length ? activities : recent.map(a=>({id:getId(a), label:'Agent added', detail:`${a.name} was added to the system.`, time:new Date(a.createdAt||Date.now())}));
   return <>
-    <PageHeading title="Welcome Back," accent="Admin!" subtitle="Manage, monitor and grow your agent network with ease and intelligence." actions={<button className="button primary" onClick={onAdd}><Plus size={17}/> Add Agent</button>}/>
+    <PageHeading title="Welcome Back," accent={`${user.name.split(/\s+/)[0]}!`} subtitle="Manage, monitor and grow your agent network with ease and intelligence." actions={<button className="button primary" onClick={onAdd}><Plus size={17}/> Add Agent</button>}/>
     {error && <ErrorBanner message={error} onRetry={onRetry}/>}
     <section className="metrics-grid">
       <MetricCard icon={Users} label="Total Agents" value={loading?'—':agents.length} tone="violet" note="Your network"/>

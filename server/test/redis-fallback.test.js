@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { beforeEach, mock, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+const userId = randomUUID();
+const listKey = `agents:list:${userId}`;
+const detailKey = (id) => `agents:${userId}:${id}`;
 const agent = {
   id: "57ec998d-6c3a-4734-8cc0-b91a24a7aa2f",
   name: "Example Agent",
@@ -11,6 +15,7 @@ const agent = {
   phone: "5550001234",
   serviceArea: "Central",
   status: "ACTIVE",
+  userId,
 };
 const input = {
   name: agent.name,
@@ -28,7 +33,14 @@ mock.module("../src/config/redis.js", { defaultExport: redis });
 mock.module("../src/app.js", { defaultExport: app });
 mock.module("dotenv/config", { namedExports: {} });
 
-const service = await import("../src/services/agent.service.js");
+const agentService = await import("../src/services/agent.service.js");
+const service = {
+  createAgent: (data) => agentService.createAgent(data, userId),
+  getAllAgents: () => agentService.getAllAgents(userId),
+  getAgentById: (id) => agentService.getAgentById(id, userId),
+  updateAgent: (id, data) => agentService.updateAgent(id, data, userId),
+  deleteAgent: (id) => agentService.deleteAgent(id, userId),
+};
 
 beforeEach((context) => {
   context.mock.method(console, "log", () => {});
@@ -51,23 +63,26 @@ beforeEach((context) => {
   app.listen = mock.fn(() => {});
 });
 
-test("cache misses preserve Prisma queries and populate unchanged keys with EX 60", async () => {
+test("cache misses preserve owner filters and populate user-scoped keys with EX 60", async () => {
   assert.deepEqual(await service.getAllAgents(), [agent]);
   assert.deepEqual(await service.getAgentById(agent.id), agent);
   assert.deepEqual(prisma.deliveryAgent.findMany.mock.calls[0].arguments, [
-    { orderBy: { createdAt: "desc" } },
+    { where: { userId }, orderBy: { createdAt: "desc" } },
   ]);
   assert.deepEqual(prisma.deliveryAgent.findUnique.mock.calls[0].arguments, [
-    { where: { id: agent.id } },
+    { where: { id: agent.id, userId } },
   ]);
   assert.deepEqual(redis.set.mock.calls.map((call) => call.arguments), [
-    ["agents:list", JSON.stringify([agent]), { EX: 60 }],
-    [`agents:${agent.id}`, JSON.stringify(agent), { EX: 60 }],
+    [listKey, JSON.stringify([agent]), { EX: 60 }],
+    [detailKey(agent.id), JSON.stringify(agent), { EX: 60 }],
   ]);
+  for (const key of [listKey, detailKey(agent.id)]) {
+    assert(console.log.mock.calls.some((call) => call.arguments[0] === `[REDIS] CACHE SET - ${key} - TTL: 60s`));
+  }
 });
 
 test("cache hits bypass PostgreSQL and cache writes", async () => {
-  redis.get = mock.fn(async (key) => JSON.stringify(key === "agents:list" ? [agent] : agent));
+  redis.get = mock.fn(async (key) => JSON.stringify(key === listKey ? [agent] : agent));
   assert.deepEqual(await service.getAllAgents(), [agent]);
   assert.deepEqual(await service.getAgentById(agent.id), agent);
   assert.equal(prisma.deliveryAgent.findMany.mock.callCount(), 0);
@@ -106,6 +121,7 @@ test("Redis SET failures do not fail database reads", async () => {
   assert.deepEqual(await service.getAllAgents(), [agent]);
   assert.deepEqual(await service.getAgentById(agent.id), agent);
   assert.equal(console.error.mock.callCount(), 2);
+  assert(!console.log.mock.calls.some((call) => call.arguments[0].includes("CACHE SET")));
 });
 
 test("mutations preserve query arguments and invalidate only after database success", async () => {
@@ -116,18 +132,20 @@ test("mutations preserve query arguments and invalidate only after database succ
   await service.createAgent(input);
   await service.updateAgent(agent.id, { status: "INACTIVE" });
   await service.deleteAgent(agent.id);
-  assert.deepEqual(prisma.deliveryAgent.create.mock.calls[0].arguments, [{ data: input }]);
+  assert.deepEqual(prisma.deliveryAgent.create.mock.calls[0].arguments, [{ data: { ...input, userId } }]);
   assert.deepEqual(prisma.deliveryAgent.update.mock.calls[0].arguments, [
-    { where: { id: agent.id }, data: { status: "INACTIVE" } },
+    { where: { id: agent.id, userId }, data: { status: "INACTIVE" } },
   ]);
   assert.deepEqual(prisma.deliveryAgent.delete.mock.calls[0].arguments, [
-    { where: { id: agent.id } },
+    { where: { id: agent.id, userId } },
   ]);
   assert.deepEqual(redis.del.mock.calls.map((call) => call.arguments), [
-    [["agents:list"]],
-    [["agents:list", `agents:${agent.id}`]],
-    [["agents:list", `agents:${agent.id}`]],
+    [[listKey]],
+    [[listKey, detailKey(agent.id)]],
+    [[listKey, detailKey(agent.id)]],
   ]);
+  assert.equal(console.log.mock.calls.filter((call) => call.arguments[0] === `[REDIS] CACHE INVALIDATED - ${listKey}`).length, 3);
+  assert.equal(console.log.mock.calls.filter((call) => call.arguments[0] === `[REDIS] CACHE INVALIDATED - ${detailKey(agent.id)}`).length, 2);
 });
 
 test("Redis invalidation failures do not fail create, update, or delete", async () => {
@@ -136,6 +154,7 @@ test("Redis invalidation failures do not fail create, update, or delete", async 
   assert.equal(await service.updateAgent(agent.id, { status: "INACTIVE" }), agent);
   assert.equal(await service.deleteAgent(agent.id), agent);
   assert.equal(console.error.mock.callCount(), 3);
+  assert(!console.log.mock.calls.some((call) => call.arguments[0].includes("CACHE INVALIDATED")));
 });
 
 test("a missing individual agent still produces the existing 404", async () => {
@@ -177,10 +196,30 @@ test("caching resumes when the client becomes ready again", async () => {
   assert.equal(redis.set.mock.callCount(), 1);
 });
 
+test("services reject missing user context before querying PostgreSQL or Redis", async () => {
+  for (const operation of [
+    () => agentService.createAgent(input),
+    () => agentService.getAllAgents(),
+    () => agentService.getAgentById(agent.id),
+    () => agentService.updateAgent(agent.id, input),
+    () => agentService.deleteAgent(agent.id),
+  ]) await assert.rejects(operation(), { statusCode: 401 });
+  assert.equal(redis.get.mock.callCount(), 0);
+  assert.equal(prisma.deliveryAgent.findMany.mock.callCount(), 0);
+  assert.equal(prisma.deliveryAgent.create.mock.callCount(), 0);
+});
+
 const loadServer = async () => {
   await import(`../src/server.js?test=${++serverImport}`);
   await new Promise(setImmediate);
 };
+
+test("a listen error is logged instead of falsely reporting a running HTTP server", async () => {
+  app.listen = mock.fn((port, callback) => callback(new Error("listen EADDRINUSE")));
+  await loadServer();
+  assert.deepEqual(console.error.mock.calls[0].arguments, ["Failed to start HTTP server:", "listen EADDRINUSE"]);
+  assert(!console.log.mock.calls.some((call) => call.arguments[0].startsWith("Server running on ")));
+});
 
 test("startup listens even while Redis connect remains pending", async () => {
   redis.connect = mock.fn(() => new Promise(() => {}));

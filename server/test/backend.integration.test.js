@@ -1,7 +1,7 @@
 import "dotenv/config";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { after, before, describe, test } from "node:test";
@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Client } from "pg";
 import { createClient } from "redis";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcrypt";
 
 const enabled = process.env.RUN_INTEGRATION === "1";
 const outages = process.env.RUN_REDIS_OUTAGE === "1";
@@ -35,6 +37,14 @@ let sequence = 0;
 let primary;
 let secondary;
 let backendEnvironment;
+let account;
+let otherAccount;
+let accessToken;
+let otherToken;
+let accountInput;
+let listKey;
+let otherAgent;
+const detailKey = (id) => `agents:${account.id}:${id}`;
 
 const freshInput = () => ({
   name: "Audit Agent",
@@ -43,12 +53,15 @@ const freshInput = () => ({
   serviceArea: `Audit ${marker}`,
 });
 
-const request = async (method, endpoint, data) => {
+const request = async (method, endpoint, data, token = accessToken) => {
   const response = await fetch(`${base}${endpoint}`, {
     method,
     signal: AbortSignal.timeout(10000),
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(data !== undefined ? { "Content-Type": "application/json" } : {}),
+    },
     ...(data !== undefined ? {
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
     } : {}),
   });
@@ -68,7 +81,7 @@ const expectError = (result, status, message) => {
   assert.equal(result.status, status);
   assert.equal(result.body.success, false);
   assert.equal(result.body.message, message);
-  assert(!JSON.stringify(result.body).match(/PrismaClient|DATABASE_URL|stack|password|node_modules/));
+  assert(!JSON.stringify(result.body).match(/PrismaClient|DATABASE_URL|stack|passwordHash|node_modules/));
 };
 
 const waitForLog = (text, start = 0) => new Promise((resolve, reject) => {
@@ -113,7 +126,7 @@ const restoreRedis = async () => {
 const cacheData = async (id) => {
   await request("GET", "/api/agents");
   await request("GET", `/api/agents/${id}`);
-  assert.equal(await cache.exists(["agents:list", `agents:${id}`]), 2);
+  assert.equal(await cache.exists([listKey, detailKey(id)]), 2);
 };
 
 const readFingerprint = async () => (await admin.query(
@@ -174,6 +187,18 @@ describe("real HTTP, PostgreSQL and Redis integration", { skip: !enabled, concur
     child.stderr.on("data", (data) => { logs += data.toString(); });
     await waitForLog("Server running on");
     await waitForLog("Redis connected successfully");
+    accountInput = { name: "Audit Account A", email: `account-a-${marker}@example.com`, password: randomBytes(20).toString("hex") };
+    const registered = await request("POST", "/api/auth/register", accountInput);
+    assert.equal(registered.status, 201);
+    account = registered.body.data.user;
+    accessToken = registered.body.data.token;
+    listKey = `agents:list:${account.id}`;
+    const other = await request("POST", "/api/auth/register", {
+      name: "Audit Account B", email: `account-b-${marker}@example.com`, password: randomBytes(20).toString("hex"),
+    });
+    assert.equal(other.status, 201);
+    otherAccount = other.body.data.user;
+    otherToken = other.body.data.token;
     primary = await createAgent();
     secondary = await createAgent();
   });
@@ -186,7 +211,9 @@ describe("real HTTP, PostgreSQL and Redis integration", { skip: !enabled, concur
     try {
       if (cache && isolatedCache) {
         if (!cache.isReady) await once(cache, "ready", { signal: AbortSignal.timeout(20000) });
-        await cache.del(["agents:list", ...[...ownedIds].map((id) => `agents:${id}`)]);
+        const users = [account, otherAccount].filter(Boolean);
+        const keys = users.flatMap((user) => [`agents:list:${user.id}`, ...[...ownedIds].map((id) => `agents:${user.id}:${id}`)]);
+        if (keys.length) await cache.del(keys);
         assert.equal(await cache.dbSize(), 0, "Integration cache cleanup must leave Redis DB 15 empty");
       }
     } catch (error) { failures.push(error); }
@@ -198,6 +225,146 @@ describe("real HTTP, PostgreSQL and Redis integration", { skip: !enabled, concur
     } catch (error) { failures.push(error); }
     if (admin) await admin.end();
     if (failures.length) throw new AggregateError(failures, "Integration cleanup failed");
+  });
+
+  test("registration returns a safe user and bcrypt hash only exists in PostgreSQL", async () => {
+    const input = { name: "New Account", email: `register-${marker}@example.com`, password: randomBytes(20).toString("hex") };
+    const result = await request("POST", "/api/auth/register", input, null);
+    assert.equal(result.status, 201);
+    assert.deepEqual(Object.keys(result.body.data.user).sort(), ["email", "id", "name"]);
+    assert(!JSON.stringify(result.body).includes("passwordHash"));
+    assert(!JSON.stringify(result.body).includes(input.password));
+    const stored = (await database.query('SELECT "passwordHash" FROM "User" WHERE id = $1', [result.body.data.user.id])).rows[0];
+    assert(await bcrypt.compare(input.password, stored.passwordHash));
+    const token = jwt.verify(result.body.data.token, process.env.JWT_SECRET, { algorithms: ["HS256"], issuer: "agent-hub", audience: "agent-hub" });
+    assert.equal(token.sub, result.body.data.user.id);
+    assert(token.exp > token.iat);
+  });
+
+  for (const [label, patch] of [
+    ["missing name", { name: undefined }],
+    ["missing email", { email: undefined }],
+    ["missing password", { password: undefined }],
+    ["invalid email", { email: "invalid" }],
+    ["short password", { password: "short" }],
+    ["bcrypt byte overflow", { password: "é".repeat(40) }],
+    ["unknown fields", { role: "admin" }],
+  ]) {
+    test(`registration rejects ${label} through HTTP`, async () => {
+      expectError(await request("POST", "/api/auth/register", {
+        name: "Invalid Account", email: `invalid-${marker}@example.com`, password: randomBytes(20).toString("hex"), ...patch,
+      }, null), 400, "Validation failed");
+    });
+  }
+
+  test("normalized duplicate registration returns 409", async () => {
+    expectError(await request("POST", "/api/auth/register", {
+      ...accountInput, email: accountInput.email.toUpperCase(),
+    }, null), 409, "Email already registered");
+  });
+
+  test("login authenticates by normalized email and returns an expiring JWT", async () => {
+    const result = await request("POST", "/api/auth/login", {
+      email: accountInput.email.toUpperCase(), password: accountInput.password,
+    }, null);
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body.data.user, account);
+    assert(!JSON.stringify(result.body).includes("passwordHash"));
+    assert.equal(jwt.verify(result.body.data.token, process.env.JWT_SECRET, { algorithms: ["HS256"], issuer: "agent-hub", audience: "agent-hub" }).sub, account.id);
+  });
+
+  test("login returns the same 401 for an unknown email and wrong password", async () => {
+    for (const credentials of [
+      { email: accountInput.email, password: "wrong-password" },
+      { email: `unknown-${marker}@example.com`, password: accountInput.password },
+    ]) expectError(await request("POST", "/api/auth/login", credentials, null), 401, "Invalid email or password");
+  });
+
+  test("me returns only the authenticated public account", async () => {
+    assert.deepEqual(await request("GET", "/api/auth/me"), { status: 200, body: { success: true, data: account } });
+    assert.deepEqual((await request("GET", "/api/auth/me", undefined, otherToken)).body.data, otherAccount);
+  });
+
+  test("all existing agent routes and me reject missing Bearer tokens", async () => {
+    for (const [method, path, data] of [
+      ["GET", "/api/agents"], ["GET", `/api/agents/${primary.id}`],
+      ["POST", "/api/agents", freshInput()], ["PATCH", `/api/agents/${primary.id}`, { name: "Denied" }],
+      ["DELETE", `/api/agents/${primary.id}`], ["GET", "/api/auth/me"],
+    ]) expectError(await request(method, path, data, null), 401, "Authentication required");
+  });
+
+  test("expired, tampered and malformed JWTs are rejected before cached data is returned", async () => {
+    const expired = jwt.sign({}, process.env.JWT_SECRET, { subject: account.id, expiresIn: -1, issuer: "agent-hub", audience: "agent-hub" });
+    const tampered = jwt.sign({}, randomBytes(32).toString("hex"), { subject: account.id, expiresIn: "1h", issuer: "agent-hub", audience: "agent-hub" });
+    for (const token of ["invalid-token", expired, tampered]) {
+      expectError(await request("GET", "/api/agents", undefined, token), 401, "Invalid or expired token");
+    }
+  });
+
+  test("each account sees only its agents and foreign reads/updates/deletes return 404", async () => {
+    const created = await request("POST", "/api/agents", freshInput(), otherToken);
+    assert.equal(created.status, 201);
+    otherAgent = created.body.data;
+    assert.equal(otherAgent.userId, otherAccount.id);
+    assert.deepEqual((await request("GET", `/api/agents/${otherAgent.id}`, undefined, otherToken)).body.data, otherAgent);
+    const ownList = await request("GET", "/api/agents");
+    assert(ownList.body.data.every((agent) => agent.userId === account.id));
+    const foreignList = await request("GET", "/api/agents", undefined, otherToken);
+    assert.deepEqual(foreignList.body.data, [otherAgent]);
+    for (const [method, data] of [["GET"], ["PATCH", { name: "Not Allowed" }], ["DELETE"]]) {
+      expectError(await request(method, `/api/agents/${otherAgent.id}`, data), 404, "Delivery agent not found");
+    }
+    expectError(await request("GET", `/api/agents/${primary.id}`, undefined, otherToken), 404, "Delivery agent not found");
+    assert.deepEqual((await request("GET", `/api/agents/${otherAgent.id}`, undefined, otherToken)).body.data, otherAgent);
+    assert.equal(await cache.exists(`agents:${account.id}:${otherAgent.id}`), 0);
+  });
+
+  test("client-supplied owner IDs are rejected on create and update", async () => {
+    expectError(await request("POST", "/api/agents", { ...freshInput(), userId: otherAccount.id }), 400, "Validation failed");
+    expectError(await request("PATCH", `/api/agents/${primary.id}`, { userId: otherAccount.id }), 400, "Validation failed");
+  });
+
+  test("Redis list/detail caches and mutation invalidation are isolated by account", async () => {
+    const foreignListKey = `agents:list:${otherAccount.id}`;
+    const foreignDetailKey = `agents:${otherAccount.id}:${otherAgent.id}`;
+    await request("GET", "/api/agents", undefined, otherToken);
+    await request("GET", `/api/agents/${otherAgent.id}`, undefined, otherToken);
+    const foreignList = await cache.get(foreignListKey);
+    const foreignDetail = await cache.get(foreignDetailKey);
+    assert(JSON.parse(foreignList).every((agent) => agent.userId === otherAccount.id));
+    await request("GET", "/api/agents");
+    assert(JSON.parse(await cache.get(listKey)).every((agent) => agent.userId === account.id));
+    const agent = await createAgent();
+    assert.equal(await cache.exists(listKey), 0);
+    assert.equal(await cache.get(foreignListKey), foreignList);
+    await cacheData(agent.id);
+    assert.equal((await request("PATCH", `/api/agents/${agent.id}`, { name: "Isolated Update" })).status, 200);
+    assert.equal(await cache.exists([listKey, detailKey(agent.id)]), 0);
+    assert.equal(await cache.get(foreignDetailKey), foreignDetail);
+    await cacheData(agent.id);
+    assert.equal((await request("DELETE", `/api/agents/${agent.id}`)).status, 200);
+    assert.equal(await cache.exists([listKey, detailKey(agent.id)]), 0);
+    assert.equal(await cache.get(foreignListKey), foreignList);
+    assert.equal(await cache.get(foreignDetailKey), foreignDetail);
+  });
+
+  test("legacy records stay private until explicit assignment, which preserves their previous fields", async () => {
+    const id = randomUUID();
+    ownedIds.add(id);
+    const input = freshInput();
+    await database.query('INSERT INTO "DeliveryAgent" (id,name,email,phone,"serviceArea","updatedAt") VALUES ($1,$2,$3,$4,$5,CURRENT_TIMESTAMP)', [id,input.name,input.email,input.phone,input.serviceArea]);
+    const fields = 'SELECT id,name,email,phone,"serviceArea",status,"createdAt","updatedAt" FROM "DeliveryAgent" WHERE id = $1';
+    const before = (await database.query(fields, [id])).rows[0];
+    for (const token of [accessToken, otherToken]) {
+      expectError(await request("GET", `/api/agents/${id}`, undefined, token), 404, "Delivery agent not found");
+    }
+    const dryRun = await execute(process.execPath, ["scripts/assign-legacy-agents.js", account.email], { cwd: serverRoot, env: backendEnvironment, timeout: 10000 });
+    assert(dryRun.stdout.includes("1 unassigned agents"));
+    assert.equal((await database.query('SELECT "userId" FROM "DeliveryAgent" WHERE id = $1', [id])).rows[0].userId, null);
+    await execute(process.execPath, ["scripts/assign-legacy-agents.js", account.email, "--confirm"], { cwd: serverRoot, env: backendEnvironment, timeout: 10000 });
+    assert.deepEqual((await database.query(fields, [id])).rows[0], before);
+    assert.equal((await request("GET", `/api/agents/${id}`)).status, 200);
+    expectError(await request("GET", `/api/agents/${id}`, undefined, otherToken), 404, "Delivery agent not found");
   });
 
   test("health responds through the actual backend entrypoint", async () => {
@@ -214,7 +381,8 @@ describe("real HTTP, PostgreSQL and Redis integration", { skip: !enabled, concur
     assert.equal(result.body.message, "Delivery agent created successfully");
     assert.equal(result.body.success, true);
     const agent = result.body.data;
-    assert.deepEqual(Object.keys(agent).sort(), ["createdAt", "email", "id", "name", "phone", "serviceArea", "status", "updatedAt"]);
+    assert.deepEqual(Object.keys(agent).sort(), ["createdAt", "email", "id", "name", "phone", "serviceArea", "status", "updatedAt", "userId"]);
+    assert.equal(agent.userId, account.id);
     for (const [field, value] of Object.entries(input)) assert.equal(agent[field], value);
     assert.equal(agent.status, "ACTIVE");
     assert.match(agent.id, /^[0-9a-f-]{36}$/);
@@ -343,46 +511,53 @@ describe("real HTTP, PostgreSQL and Redis integration", { skip: !enabled, concur
   });
 
   test("list cache miss/hit produces actual Redis JSON and a non-refreshed 60-second TTL", async () => {
-    await cache.del("agents:list");
+    await cache.del(listKey);
     const start = logs.length;
     const first = await request("GET", "/api/agents");
-    await waitForLog("Redis cache MISS: agents:list", start);
-    assert.deepEqual(JSON.parse(await cache.get("agents:list")), first.body.data);
-    const ttl = await cache.pTTL("agents:list");
+    await waitForLog(`Redis cache MISS: ${listKey}`, start);
+    await waitForLog(`[REDIS] CACHE SET - ${listKey} - TTL: 60s`, start);
+    assert.deepEqual(JSON.parse(await cache.get(listKey)), first.body.data);
+    const ttl = await cache.pTTL(listKey);
     assert(ttl > 55000 && ttl <= 60000);
     const secondStart = logs.length;
     assert.deepEqual(await request("GET", "/api/agents"), first);
-    await waitForLog("Redis cache HIT: agents:list", secondStart);
-    assert((await cache.pTTL("agents:list")) <= ttl);
+    await waitForLog(`Redis cache HIT: ${listKey}`, secondStart);
+    assert((await cache.pTTL(listKey)) <= ttl);
   });
 
   test("individual cache miss/hit produces actual JSON and 60-second TTL", async () => {
-    await cache.del(`agents:${secondary.id}`);
+    await cache.del(detailKey(secondary.id));
     const start = logs.length;
     const first = await request("GET", `/api/agents/${secondary.id}`);
-    await waitForLog(`Redis cache MISS: agents:${secondary.id}`, start);
-    assert.deepEqual(JSON.parse(await cache.get(`agents:${secondary.id}`)), first.body.data);
-    const ttl = await cache.pTTL(`agents:${secondary.id}`);
+    await waitForLog(`Redis cache MISS: ${detailKey(secondary.id)}`, start);
+    await waitForLog(`[REDIS] CACHE SET - ${detailKey(secondary.id)} - TTL: 60s`, start);
+    assert.deepEqual(JSON.parse(await cache.get(detailKey(secondary.id))), first.body.data);
+    const ttl = await cache.pTTL(detailKey(secondary.id));
     assert(ttl > 55000 && ttl <= 60000);
     const secondStart = logs.length;
     assert.deepEqual(await request("GET", `/api/agents/${secondary.id}`), first);
-    await waitForLog(`Redis cache HIT: agents:${secondary.id}`, secondStart);
-    assert((await cache.pTTL(`agents:${secondary.id}`)) <= ttl);
+    await waitForLog(`Redis cache HIT: ${detailKey(secondary.id)}`, secondStart);
+    assert((await cache.pTTL(detailKey(secondary.id))) <= ttl);
   });
 
   test("create invalidates a populated list cache and the next GET includes fresh data", async () => {
     await request("GET", "/api/agents");
-    assert.equal(await cache.exists("agents:list"), 1);
+    assert.equal(await cache.exists(listKey), 1);
+    const start = logs.length;
     const agent = await createAgent();
-    assert.equal(await cache.exists("agents:list"), 0);
+    await waitForLog(`[REDIS] CACHE INVALIDATED - ${listKey}`, start);
+    assert.equal(await cache.exists(listKey), 0);
     assert((await request("GET", "/api/agents")).body.data.some((item) => item.id === agent.id));
   });
 
   test("update invalidates populated list/detail caches and the next GET is fresh", async () => {
     await cacheData(secondary.id);
+    const start = logs.length;
     const result = await request("PATCH", `/api/agents/${secondary.id}`, { serviceArea: "Cache Fresh Area" });
     assert.equal(result.status, 200);
-    assert.equal(await cache.exists(["agents:list", `agents:${secondary.id}`]), 0);
+    await waitForLog(`[REDIS] CACHE INVALIDATED - ${listKey}`, start);
+    await waitForLog(`[REDIS] CACHE INVALIDATED - ${detailKey(secondary.id)}`, start);
+    assert.equal(await cache.exists([listKey, detailKey(secondary.id)]), 0);
     assert.equal((await request("GET", `/api/agents/${secondary.id}`)).body.data.serviceArea, "Cache Fresh Area");
     assert.equal((await request("GET", "/api/agents")).body.data.find((agent) => agent.id === secondary.id).serviceArea, "Cache Fresh Area");
   });
@@ -390,27 +565,30 @@ describe("real HTTP, PostgreSQL and Redis integration", { skip: !enabled, concur
   test("delete invalidates populated list/detail caches and subsequent reads exclude the agent", async () => {
     const agent = await createAgent();
     await cacheData(agent.id);
+    const start = logs.length;
     assert.equal((await request("DELETE", `/api/agents/${agent.id}`)).status, 200);
-    assert.equal(await cache.exists(["agents:list", `agents:${agent.id}`]), 0);
+    await waitForLog(`[REDIS] CACHE INVALIDATED - ${listKey}`, start);
+    await waitForLog(`[REDIS] CACHE INVALIDATED - ${detailKey(agent.id)}`, start);
+    assert.equal(await cache.exists([listKey, detailKey(agent.id)]), 0);
     expectError(await request("GET", `/api/agents/${agent.id}`), 404, "Delivery agent not found");
     assert(!(await request("GET", "/api/agents")).body.data.some((item) => item.id === agent.id));
   });
 
   test("actual malformed cached JSON falls back to PostgreSQL and repairs the cache", async () => {
-    await cache.set(`agents:${secondary.id}`, "invalid JSON", { EX: 60 });
+    await cache.set(detailKey(secondary.id), "invalid JSON", { EX: 60 });
     const result = await request("GET", `/api/agents/${secondary.id}`);
     assert.equal(result.status, 200);
     assert.equal(result.body.data.id, secondary.id);
-    assert.deepEqual(JSON.parse(await cache.get(`agents:${secondary.id}`)), result.body.data);
+    assert.deepEqual(JSON.parse(await cache.get(detailKey(secondary.id))), result.body.data);
   });
 
   test("the migrated test database schema and enum match the Prisma contract", async () => {
     const fields = await database.query("SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'DeliveryAgent'");
-    assert.deepEqual(fields.rows.map((field) => field.column_name).sort(), ["createdAt", "email", "id", "name", "phone", "serviceArea", "status", "updatedAt"]);
+    assert.deepEqual(fields.rows.map((field) => field.column_name).sort(), ["createdAt", "email", "id", "name", "phone", "serviceArea", "status", "updatedAt", "userId"]);
     const statuses = await database.query("SELECT enumlabel FROM pg_enum JOIN pg_type ON pg_enum.enumtypid = pg_type.oid WHERE typname = 'AgentStatus' ORDER BY enumsortorder");
     assert.deepEqual(statuses.rows.map((status) => status.enumlabel), ["ACTIVE", "INACTIVE"]);
     const migrations = await database.query('SELECT migration_name, finished_at IS NOT NULL AS applied FROM "_prisma_migrations" ORDER BY migration_name');
-    assert.equal(migrations.rowCount, 2);
+    assert.equal(migrations.rowCount, 3);
     assert(migrations.rows.every((migration) => migration.applied));
   });
 
@@ -500,21 +678,21 @@ describe("real HTTP, PostgreSQL and Redis integration", { skip: !enabled, concur
       await waitForLog("Redis connected successfully", start);
       if (!cache.isReady) await once(cache, "ready", { signal: AbortSignal.timeout(20000) });
       assert.equal(await cache.ping(), "PONG");
-      await cache.del(["agents:list", `agents:${existing.id}`]);
+      await cache.del([listKey, detailKey(existing.id)]);
       const cursor = logs.length;
       const list = await request("GET", "/api/agents");
-      await waitForLog("Redis cache MISS: agents:list", cursor);
+      await waitForLog(`Redis cache MISS: ${listKey}`, cursor);
       const hitCursor = logs.length;
       assert.deepEqual(await request("GET", "/api/agents"), list);
-      await waitForLog("Redis cache HIT: agents:list", hitCursor);
+      await waitForLog(`Redis cache HIT: ${listKey}`, hitCursor);
       const detailCursor = logs.length;
       assert.equal((await request("GET", `/api/agents/${existing.id}`)).status, 200);
-      await waitForLog(`Redis cache MISS: agents:${existing.id}`, detailCursor);
+      await waitForLog(`Redis cache MISS: ${detailKey(existing.id)}`, detailCursor);
       const detailHitCursor = logs.length;
       assert.equal((await request("GET", `/api/agents/${existing.id}`)).status, 200);
-      await waitForLog(`Redis cache HIT: agents:${existing.id}`, detailHitCursor);
-      assert((await cache.ttl("agents:list")) > 0 && (await cache.ttl("agents:list")) <= 60);
-      assert((await cache.ttl(`agents:${existing.id}`)) > 0);
+      await waitForLog(`Redis cache HIT: ${detailKey(existing.id)}`, detailHitCursor);
+      assert((await cache.ttl(listKey)) > 0 && (await cache.ttl(listKey)) <= 60);
+      assert((await cache.ttl(detailKey(existing.id))) > 0);
       assert.equal(child.exitCode, null);
       assert.equal(child.signalCode, null);
     });

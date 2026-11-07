@@ -1,7 +1,7 @@
 import * as agentService from "../services/agent.service.js";
 
 export const createAgent = async (req, res) => {
-  const agent = await agentService.createAgent(req.body);
+  const agent = await agentService.createAgent(req.body, req.userId);
 
   res.status(201).json({
     success: true,
@@ -11,7 +11,7 @@ export const createAgent = async (req, res) => {
 };
 
 export const getAllAgents = async (req, res) => {
-  const agents = await agentService.getAllAgents();
+  const agents = await agentService.getAllAgents(req.userId);
 
   res.status(200).json({
     success: true,
@@ -21,7 +21,7 @@ export const getAllAgents = async (req, res) => {
 };
 
 export const getAgentById = async (req, res) => {
-  const agent = await agentService.getAgentById(req.params.id);
+  const agent = await agentService.getAgentById(req.params.id, req.userId);
 
   res.status(200).json({
     success: true,
@@ -32,7 +32,8 @@ export const getAgentById = async (req, res) => {
 export const updateAgent = async (req, res) => {
   const agent = await agentService.updateAgent(
     req.params.id,
-    req.body
+    req.body,
+    req.userId
   );
 
   res.status(200).json({
@@ -43,7 +44,7 @@ export const updateAgent = async (req, res) => {
 };
 
 export const deleteAgent = async (req, res) => {
-  await agentService.deleteAgent(req.params.id);
+  await agentService.deleteAgent(req.params.id, req.userId);
 
   res.status(200).json({
     success: true,

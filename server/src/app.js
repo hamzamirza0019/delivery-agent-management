@@ -4,6 +4,7 @@ import helmet from "helmet";
 import morgan from "morgan";
 
 import agentRoutes from "./routes/agent.routes.js";
+import authRoutes from "./routes/auth.routes.js";
 import { errorHandler } from "./middleware/error.middleware.js";
 
 const app = express();
@@ -20,6 +21,7 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+app.use("/api/auth", authRoutes);
 app.use("/api/agents", agentRoutes);
 
 app.use((req, res) => {

@@ -4,47 +4,53 @@ import redis from "../config/redis.js";
 
 const CACHE_TTL = 60;
 
-const AGENT_LIST_KEY = "agents:list";
+const requireUserId = (userId) => {
+  if (!userId) throw Object.assign(new Error("Authentication required"), { statusCode: 401 });
+  return userId;
+};
 
-const getAgentCacheKey = (id) => `agents:${id}`;
+const getAgentListKey = (userId) => `agents:list:${requireUserId(userId)}`;
+const getAgentCacheKey = (id, userId) => `agents:${requireUserId(userId)}:${id}`;
 
-export const createAgent = async (data) => {
+export const createAgent = async (data, userId) => {
   const agent = await prisma.deliveryAgent.create({
-    data,
+    data: { ...data, userId: requireUserId(userId) },
   });
 
   // Invalidate cached agent list
-  await invalidateCache(AGENT_LIST_KEY);
+  await invalidateCache(getAgentListKey(userId));
 
   return agent;
 };
 
-export const getAllAgents = async () => {
+export const getAllAgents = async (userId) => {
+  const cacheKey = getAgentListKey(userId);
   // 1. Check Redis first
-  const cachedAgents = await getCache(AGENT_LIST_KEY);
+  const cachedAgents = await getCache(cacheKey);
 
   if (cachedAgents) {
-    console.log("Redis cache HIT: agents:list");
+    console.log(`Redis cache HIT: ${cacheKey}`);
     return cachedAgents;
   }
 
-  console.log("Redis cache MISS: agents:list");
+  console.log(`Redis cache MISS: ${cacheKey}`);
 
   // 2. Fetch from PostgreSQL
   const agents = await prisma.deliveryAgent.findMany({
+    where: { userId },
     orderBy: {
       createdAt: "desc",
     },
   });
 
   // 3. Store result in Redis for 60 seconds
-  await setCache(AGENT_LIST_KEY, agents);
+  await setCache(cacheKey, agents);
 
   return agents;
 };
 
-export const getAgentById = async (id) => {
-  const cacheKey = getAgentCacheKey(id);
+export const getAgentById = async (id, userId) => {
+  const cacheKey = getAgentCacheKey(id, userId);
 
   // 1. Check Redis
   const cachedAgent = await getCache(cacheKey);
@@ -58,7 +64,7 @@ export const getAgentById = async (id) => {
 
   // 2. Fetch from PostgreSQL
   const agent = await prisma.deliveryAgent.findUnique({
-    where: { id },
+    where: { id, userId },
   });
 
   if (!agent) {
@@ -73,25 +79,25 @@ export const getAgentById = async (id) => {
   return agent;
 };
 
-export const updateAgent = async (id, data) => {
+export const updateAgent = async (id, data, userId) => {
   const agent = await prisma.deliveryAgent.update({
-    where: { id },
+    where: { id, userId: requireUserId(userId) },
     data,
   });
 
   // Invalidate both list and individual agent cache
-  await invalidateCache(AGENT_LIST_KEY, getAgentCacheKey(id));
+  await invalidateCache(getAgentListKey(userId), getAgentCacheKey(id, userId));
 
   return agent;
 };
 
-export const deleteAgent = async (id) => {
+export const deleteAgent = async (id, userId) => {
   const agent = await prisma.deliveryAgent.delete({
-    where: { id },
+    where: { id, userId: requireUserId(userId) },
   });
 
   // Invalidate both caches
-  await invalidateCache(AGENT_LIST_KEY, getAgentCacheKey(id));
+  await invalidateCache(getAgentListKey(userId), getAgentCacheKey(id, userId));
 
   return agent;
 };
@@ -117,6 +123,7 @@ const setCache = async (key, value) => {
 
   try {
     await redis.set(key, JSON.stringify(value), { EX: CACHE_TTL });
+    console.log(`[REDIS] CACHE SET - ${key} - TTL: ${CACHE_TTL}s`);
   } catch (error) {
     console.error("Redis SET failed:", error.message);
   }
@@ -129,6 +136,7 @@ const invalidateCache = async (...keys) => {
 
   try {
     await redis.del(keys);
+    for (const key of keys) console.log(`[REDIS] CACHE INVALIDATED - ${key}`);
   } catch (error) {
     console.error("Redis DELETE failed:", error.message);
   }

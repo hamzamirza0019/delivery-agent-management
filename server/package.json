@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --experimental-test-module-mocks --test test/*.test.js",
+    "test": "node --import ./test/setup.js --experimental-test-module-mocks --test test/*.test.js",
+    "assign:legacy-agents": "node scripts/assign-legacy-agents.js",
     "dev": "node --watch src/server.js",
     "start": "node src/server.js"
   },
@@ -13,10 +14,12 @@
   "license": "ISC",
   "dependencies": {
     "@prisma/client": "^6.19.3",
+    "bcrypt": "6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^18.0.9",
     "express": "^5.3.0",
     "helmet": "^8.3.0",
+    "jsonwebtoken": "9.0.3",
     "morgan": "^1.12.1",
     "pg": "^8.23.1",
     "redis": "^6.3.1",

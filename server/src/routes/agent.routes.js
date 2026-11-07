@@ -2,6 +2,7 @@ import { Router } from "express";
 import * as agentController from "../controllers/agent.controller.js";
 
 import { validate } from "../middleware/validate.middleware.js";
+import { authenticate } from "../middleware/auth.middleware.js";
 
 import {
   createAgentSchema,
@@ -10,6 +11,7 @@ import {
 } from "../validators/agent.validator.js";
 
 const router = Router();
+router.use(authenticate);
 
 router.post(
   "/",

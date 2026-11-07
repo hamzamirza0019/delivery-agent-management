@@ -2,8 +2,9 @@ import "dotenv/config";
 import app from "./app.js";
 import prisma from "./config/database.js";
 import redis from "./config/redis.js";
+import { env } from "./config/env.js";
 
-const PORT = process.env.PORT || 5000;
+const PORT = env.PORT;
 
 redis.on("ready", () => {
   console.log("Redis connected successfully");
@@ -20,7 +21,11 @@ async function startServer() {
       });
     }
 
-    app.listen(PORT, () => {
+    app.listen(PORT, (error) => {
+      if (error) {
+        console.error("Failed to start HTTP server:", error.message);
+        return;
+      }
       console.log(`Server running on http://localhost:${PORT}`);
     });
   } catch (error) {
